@@ -12,6 +12,7 @@ def gamma(hdrs, EVs = [1]):
         bpp = 12
         hdr_clip = torch.clamp(hdr, min=1e-12, max=2**bpp-1)
         hdr_norm = hdr_clip/(2**bpp-1)
+        # ldr = torch.clamp(hdr_norm**(1/2.2), min=0.0, max = 1.0)
         ldr = hdr_norm**(1/2.2)
         ldrs.append(torch.clamp(ldr, min= 0.0, max = 1.0))
     ldrs = torch.stack(ldrs)
@@ -41,17 +42,104 @@ def multiScaleHist(ldr, scales = [1,2,5], bins_num=128):
             for j in range(scales[1]):
                 hist =  torch.histc(ldr[:, :, i*h:(i+1)*h, j*w:(j+1)*w].flatten(), bins_num, min=0.0, max=1.0) /(h*w)
                 hist_list.append(hist)
-        # 7*7
         h = int(H/scales[2])
         w = int(W/scales[2])
         for i in range(scales[2]):
             for j in range(scales[2]):
                 hist =  torch.histc(ldr[:, :, i*h:(i+1)*h, j*w:(j+1)*w].flatten(), bins_num, min=0.0, max=1.0) /(h*w)
                 hist_list.append(hist)  
+                
         hist_batch.append(torch.stack(hist_list, dim = 0))
     result = torch.stack(hist_batch, dim = 0)
     return result
 
+class HistLayer(nn.Module):
+    """Deep Neural Network Layer for Computing Differentiable Histogram.
+    Computes a differentiable histogram using a hard-binning operation implemented using
+    CNN layers as desribed in `"Differentiable Histogram with Hard-Binning"
+    <https://arxiv.org/pdf/1512.03385.pdf>`_.
+    Attributes:
+        in_channel (int): Number of image input channels.
+        numBins (int): Number of histogram bins.
+        learnable (bool): Flag to determine whether histogram bin widths and centers are
+            learnable.
+        centers (List[float]): Histogram centers.
+        widths (List[float]): Histogram widths.
+        two_d (bool): Flag to return flattened or 2D histogram.
+        bin_centers_conv (nn.Module): 2D CNN layer with weight=1 and bias=`centers`.
+        bin_widths_conv (nn.Module): 2D CNN layer with weight=-1 and bias=`width`.
+        threshold (nn.Module): DNN layer for performing hard-binning.
+        hist_pool (nn.Module): Pooling layer.
+    """
+
+    def __init__(self, in_channels=1, num_bins=128):
+        super(HistLayer, self).__init__()
+
+        # histogram data
+        self.in_channels = in_channels
+        self.numBins = num_bins
+        self.learnable = False
+        bin_edges = np.linspace(0, 1, num_bins + 1)
+        centers = bin_edges + (bin_edges[2] - bin_edges[1]) / 2
+        self.centers = centers[:-1]
+        self.width = (bin_edges[2] - bin_edges[1]) / 2
+
+        # prepare NN layers for histogram computation
+        self.bin_centers_conv = nn.Conv2d(
+            self.in_channels,
+            self.numBins * self.in_channels,
+            1,
+            groups=self.in_channels,
+            bias=True,
+        )
+        self.bin_centers_conv.weight.data.fill_(1)
+        self.bin_centers_conv.weight.requires_grad = False
+        self.bin_centers_conv.bias.data = torch.nn.Parameter(
+            -torch.tensor(self.centers, dtype=torch.float32)
+        )
+        self.bin_centers_conv.bias.requires_grad = self.learnable
+
+        self.bin_widths_conv = nn.Conv2d(
+            self.numBins * self.in_channels,
+            self.numBins * self.in_channels,
+            1,
+            groups=self.numBins * self.in_channels,
+            bias=True,
+        )
+        self.bin_widths_conv.weight.data.fill_(-1)
+        self.bin_widths_conv.weight.requires_grad = False
+        self.bin_widths_conv.bias.data.fill_(self.width)
+        self.bin_widths_conv.bias.requires_grad = self.learnable
+
+        self.centers = self.bin_centers_conv.bias
+        self.widths = self.bin_widths_conv.weight
+        self.threshold = nn.Threshold(1, 0)
+        self.hist_pool = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, input_image):
+        """Computes differentiable histogram.
+        Args:
+            input_image: input image.
+        Returns:
+            flattened and un-flattened histogram.
+        """
+        # |x_i - u_k|
+        xx = self.bin_centers_conv(input_image)
+        xx = torch.abs(xx)
+
+        # w_k - |x_i - u_k|
+        xx = self.bin_widths_conv(xx)
+
+        # 1.01^(w_k - |x_i - u_k|)
+        xx = torch.pow(torch.empty_like(xx).fill_(1.01), xx)
+
+        # Φ(1.01^(w_k - |x_i - u_k|), 1, 0)
+        xx = self.threshold(xx)
+
+        # clean-up
+        xx = self.hist_pool(xx)
+        one_d = torch.flatten(xx, 1)
+        return one_d
        
     
 class hist_loss(nn.Module):
@@ -64,65 +152,57 @@ class hist_loss(nn.Module):
            self.p_equal = self.p_equal.cuda() 
     
     
-    def hist_region(self, gray, block_size):
+    def ldr_loss(self, ldr, block_size = [1,3], weights = [0.2, 0.8], include_sky = False, diff_flag = True):
+        n_channel, _, _ = ldr.shape
+        loss = 0
+
+        if n_channel == 3:            
+            gray = rgb2gray(ldr)
+        else:
+            gray = ldr
+
+        for idx, block in enumerate(block_size):
+            h = self.hist_region(gray, block, include_sky, diff_flag)         
+            hist_ref = [self.p_equal] * block**2
+            l = self.sim_to_ref_hist(h, hist_ref)
+            loss += l * weights[idx]
+        return loss/(sum(weights))
+
+
+    def hist_region(self, gray, block_size, include_sky = False, diff_flag = True):
         _, H, W = gray.shape
         hs = int(H/block_size)
         ws = int(W/block_size)
         hist = []
         for i in range(block_size):
+            if not include_sky and block_size>1 and i == 0:
+                continue
             for j in range(block_size):
                 x = gray[0, i*hs:(i+1)*hs, j*ws:(j+1)*ws]
-                p = histogram(x.flatten().unsqueeze(0), torch.torch.linspace(0.0, 1.0, self.bins), bandwidth=torch.tensor(0.005))
+                if diff_flag:
+                    p = histogram(x.flatten().unsqueeze(0), torch.torch.linspace(0.0, 1.0, self.bins), bandwidth=torch.tensor(0.005))
+                else:
+                    p = torch.histc(x.flatten().unsqueeze(0), self.bins, min=0.0, max=1.0)/(H*W)
                 hist.append(p)
-
         return hist
     
     def sim_to_ref_hist(self, hist, hist_ref):
         score = []
         for i, p in enumerate(hist):
             cos_hist =  F.cosine_similarity(p, hist_ref[i])
-            loss = 1.0 - cos_hist      
-            score.append(loss)
+            score.append(cos_hist)
         return torch.mean(torch.stack(score))
     
 
-    def forward(self, hdr, param, block_size = [1, 5]):
+    def forward(self, hdr, param, block_size = [1, 5], weights = [0.2, 0.8]):
         n_sample, n_channel, _, _ = hdr.shape
         loss = []
-        weights = [1.0, 1.0]
-        for i in range(n_sample):
-            l_temp = 0
-            ldr = gamma(hdr[i], param[i])
-            if n_channel == 3:            
-                ldr = rgb2gray(ldr)
-            
-            for idx, block in enumerate(block_size):
-                h = self.hist_region(ldr, block)         
-                hist_ref = [self.p_equal] * block**2
-                l = self.sim_to_ref_hist(h, hist_ref)
-                l_temp += l * weights[idx] 
-            loss.append(l_temp)
-        return torch.mean(torch.stack(loss))
-
-
-    def loss_ldr(self, ldr, block_size =  [1, 5]):
-        n_channel, _, _ = ldr.shape
-        loss = 0
-        weights = [1.0, 1.0]
-
+        ldrs = gamma(hdr, param)
         if n_channel == 3:            
-            gray = rgb2gray(ldr)
-        else:
-            gray = ldr
-        for idx, block in enumerate(block_size):
-            h = self.hist_region(gray, block)         
-            hist_ref = [self.p_equal] * block**2
-            l = self.sim_to_ref_hist(h, hist_ref)
-            loss += l * weights[idx] 
-
-        return loss
-    
-   
+            ldrs = rgb2gray(ldrs)
+        for ldr in ldrs:
+            loss.append(self.ldr_loss(ldr, block_size, weights))
+        return torch.mean(torch.stack(loss))
 
 
 def marginal_pdf(values: torch.Tensor, bins: torch.Tensor, sigma: torch.Tensor,
@@ -206,7 +286,3 @@ def histogram(x: torch.Tensor, bins: torch.Tensor, bandwidth: torch.Tensor,
     pdf, _ = marginal_pdf(x.unsqueeze(2), bins, bandwidth, epsilon)
 
     return pdf
-    
-              
-
-
